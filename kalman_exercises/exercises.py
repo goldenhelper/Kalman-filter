@@ -36,9 +36,10 @@ def predict_state(
     Returns:
         ``(x_pred, P_pred)``.
     """
+    x_pred = F @ x
+    P_pred = F @ P @ F.T + Q
     
-    
-
+    return x_pred, P_pred
 
 def update_state(
     x_pred: np.ndarray,
