@@ -1,0 +1,469 @@
+"""
+Kalman Filter for Crypto Pairs Trading
+=======================================
+
+This script demonstrates one of the most elegant practical uses of a Kalman
+filter in finance: dynamically estimating the time-varying hedge ratio between
+two correlated assets, then trading the resulting "spread" as a mean-reverting
+signal.
+
+WHY A KALMAN FILTER FOR THIS?
+-----------------------------
+In classical pairs trading, you assume a *static* relationship:
+
+    y_t = beta * x_t + alpha + epsilon_t
+
+You estimate beta once via OLS over a lookback window. The problem: in crypto,
+the relationship between two assets (say ETH and BTC) drifts. Liquidity
+changes, narratives change, ETH can decouple from BTC for weeks at a time.
+A static beta estimated on stale data will give you a "spread" that is itself
+trending — and your mean-reversion bet blows up.
+
+The Kalman filter lets us model beta and alpha as latent states that evolve
+*slowly* over time (random walk), and update our estimate every time a new
+price arrives. We get an online estimator that:
+
+    1. Adapts to regime changes automatically.
+    2. Provides a principled measure of uncertainty (state covariance P).
+    3. Gives us the "innovation" (prediction error) for free — that is exactly
+       the trading signal.
+
+THE STATE-SPACE MODEL
+---------------------
+We treat the regression coefficients as the hidden state:
+
+    state_t = [beta_t, alpha_t]^T
+
+State transition (random walk — coefficients drift slowly):
+
+    state_t = state_{t-1} + w_t,    w_t ~ N(0, Q)
+
+Observation (the price of asset Y at time t):
+
+    y_t = H_t * state_t + v_t,      v_t ~ N(0, R)
+
+where H_t = [x_t, 1] is the regressor row at time t. So:
+
+    y_t = beta_t * x_t + alpha_t + v_t
+
+This is exactly a linear regression where the coefficients are themselves a
+random walk. Q controls how fast we let beta drift; R is the observation
+noise (how much spread variance we expect even with the "true" beta).
+
+THE FILTERING EQUATIONS (textbook form)
+---------------------------------------
+Given posterior estimate (state_{t-1|t-1}, P_{t-1|t-1}):
+
+PREDICT:
+    state_{t|t-1} = F * state_{t-1|t-1}        (here F = I, random walk)
+    P_{t|t-1}     = F * P_{t-1|t-1} * F^T + Q  =  P_{t-1|t-1} + Q
+
+UPDATE (after observing y_t with regressor row H_t):
+    y_hat_t = H_t * state_{t|t-1}              (predicted y)
+    e_t     = y_t - y_hat_t                    (innovation / prediction error)
+    S_t     = H_t * P_{t|t-1} * H_t^T + R      (innovation variance)
+    K_t     = P_{t|t-1} * H_t^T / S_t          (Kalman gain)
+    state_{t|t} = state_{t|t-1} + K_t * e_t
+    P_{t|t}     = (I - K_t * H_t) * P_{t|t-1}
+
+THE TRADING SIGNAL
+------------------
+The innovation e_t IS our spread, and S_t is its expected variance. So the
+standardized signal is z_t = e_t / sqrt(S_t). When |z_t| is large, the spread
+has deviated more than usual from what the filter expects — we bet on
+reversion:
+
+    z_t < -entry  ->  spread is "too low":  LONG y, SHORT beta_t units of x
+    z_t > +entry  ->  spread is "too high": SHORT y, LONG beta_t units of x
+    |z_t| < exit  ->  flatten
+
+USAGE
+-----
+By default this runs against synthetic but realistic crypto-like data so it
+works anywhere. To use live Binance data, set USE_LIVE_DATA = True (requires
+network access to api.binance.com — works in most regions but may be blocked
+on some cloud servers).
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from dataclasses import dataclass
+from typing import Optional
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+
+USE_LIVE_DATA = True       # Set False to use synthetic data instead.
+SYMBOL_Y      = "ETHUSDT"  # Asset whose price we "predict" from the other.
+SYMBOL_X      = "BTCUSDT"  # The regressor.
+INTERVAL      = "1h"       # Binance kline interval.
+LIMIT         = 1000       # Number of candles (max 1000 per request).
+
+# Kalman filter tuning. These are the only two real knobs.
+#   delta  — controls Q (how fast beta/alpha can drift). Larger delta = faster
+#            adaptation but the filter eats the spread mean-reversion you
+#            want to trade. Smaller delta = filter behaves more like static
+#            OLS but adapts to true regime change. The sweet spot is small:
+#            1e-7 to 1e-5 for hourly crypto data is typical.
+#   R      — observation noise *variance* (not std). It has units of price^2.
+#            The script auto-calibrates R from the data if AUTO_R is True.
+DELTA  = 1e-6
+AUTO_R = True
+R_OBS  = 100.0   # used only if AUTO_R is False
+
+# Trading rules (z-score thresholds on the standardized innovation).
+ENTRY_Z = 2.0
+EXIT_Z  = 0.5
+
+# Cost model: round-trip transaction cost as a fraction of notional traded.
+# 4 bps per leg per turnaround is a reasonable Binance-spot estimate.
+TC_PER_TURNOVER = 0.0004
+
+
+# -----------------------------------------------------------------------------
+# Data loading
+# -----------------------------------------------------------------------------
+
+def fetch_binance_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+    """Fetch OHLCV klines from Binance public REST API. No API key needed."""
+    import requests
+    url = "https://api.binance.com/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    cols = ["open_time", "open", "high", "low", "close", "volume",
+            "close_time", "qav", "trades", "tbav", "tqav", "ignore"]
+    df = pd.DataFrame(r.json(), columns=cols)
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+    df["close"] = df["close"].astype(float)
+    return df.set_index("close_time")[["close"]].rename(columns={"close": symbol})
+
+
+def make_synthetic_data(n: int = 1500, seed: int = 7) -> pd.DataFrame:
+    """
+    Generate two correlated price series with a *time-varying* hedge ratio
+    AND a mean-reverting spread, mimicking what real cointegrated crypto
+    pairs look like. This gives the Kalman filter both:
+
+      (a) regime change in beta → static OLS would miss it
+      (b) mean-reverting innovations → tradeable signal
+
+    Spread dynamics: AR(1) Ornstein-Uhlenbeck around zero with half-life ~12h.
+    """
+    rng = np.random.default_rng(seed)
+
+    # BTC log-price as a random walk.
+    btc = 60_000 * np.exp(np.cumsum(rng.normal(0, 0.005, n)))
+
+    # beta drifts slowly: two clear regime shifts via piecewise-linear sin.
+    beta = 0.055 + 0.012 * np.sin(np.linspace(0, 2.5 * np.pi, n))
+
+    # Mean-reverting OU spread. phi=0.94 -> half-life ~ ln(0.5)/ln(0.94) ≈ 11 bars.
+    phi, sigma = 0.94, 80.0
+    spread = np.zeros(n)
+    for t in range(1, n):
+        spread[t] = phi * spread[t-1] + rng.normal(0, sigma)
+
+    eth = beta * btc + 50 + spread
+    idx = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
+    return pd.DataFrame({SYMBOL_X: btc, SYMBOL_Y: eth}, index=idx)
+
+
+def load_data() -> pd.DataFrame:
+    if USE_LIVE_DATA:
+        try:
+            x = fetch_binance_klines(SYMBOL_X, INTERVAL, LIMIT)
+            y = fetch_binance_klines(SYMBOL_Y, INTERVAL, LIMIT)
+            df = x.join(y, how="inner").dropna()
+            print(f"Loaded {len(df)} live candles "
+                  f"from {df.index[0]} to {df.index[-1]}")
+            return df
+        except Exception as e:
+            print(f"Live data failed ({e}); falling back to synthetic.")
+    df = make_synthetic_data()
+    print(f"Using synthetic data, {len(df)} rows.")
+    return df
+
+
+# -----------------------------------------------------------------------------
+# The Kalman filter
+# -----------------------------------------------------------------------------
+
+@dataclass
+class KalmanResult:
+    beta:   np.ndarray  # estimated beta_t at each step
+    alpha:  np.ndarray  # estimated alpha_t at each step
+    e:      np.ndarray  # innovation (spread) at each step
+    S:      np.ndarray  # innovation variance at each step
+    z:      np.ndarray  # standardized innovation = e / sqrt(S)
+
+
+def run_kalman(x: np.ndarray, y: np.ndarray,
+               delta: float = DELTA, R: float = R_OBS) -> KalmanResult:
+    """
+    Run a 2-state (beta, alpha) Kalman filter on the regression  y_t = beta*x + alpha.
+
+    Q is set as Q = (delta / (1-delta)) * I, the standard "static" choice
+    used by Chan in *Algorithmic Trading* (2013) — it parameterises drift in
+    a way that is roughly scale-invariant.
+    """
+    n = len(y)
+    # Process noise covariance — how much beta/alpha can drift each step.
+    Q = (delta / (1.0 - delta)) * np.eye(2)
+
+    # Initial state: no prior information about beta/alpha. Diffuse prior
+    # via large initial covariance forces the filter to learn from data fast.
+    state = np.zeros(2)        # [beta, alpha]
+    P     = np.eye(2) * 1e4    # huge -> diffuse
+
+    beta_hist  = np.zeros(n)
+    alpha_hist = np.zeros(n)
+    e_hist     = np.zeros(n)
+    S_hist     = np.zeros(n)
+
+    for t in range(n):
+        # --- PREDICT ----------------------------------------------------
+        # State transition is identity (random walk), so state stays;
+        # only covariance grows by Q.
+        P = P + Q
+
+        # --- UPDATE -----------------------------------------------------
+        H = np.array([x[t], 1.0])          # regressor row [x_t, 1]
+        y_hat = H @ state                  # predicted observation
+        e = y[t] - y_hat                   # innovation
+        S = H @ P @ H + R                  # innovation variance (scalar)
+        K = (P @ H) / S                    # Kalman gain (2-vector)
+        state = state + K * e              # posterior mean
+        P = P - np.outer(K, H) @ P         # posterior covariance
+
+        beta_hist[t]  = state[0]
+        alpha_hist[t] = state[1]
+        e_hist[t]     = e
+        S_hist[t]     = S
+
+    z_hist = e_hist / np.sqrt(S_hist)
+    return KalmanResult(beta_hist, alpha_hist, e_hist, S_hist, z_hist)
+
+
+# -----------------------------------------------------------------------------
+# Backtest
+# -----------------------------------------------------------------------------
+
+def backtest(df: pd.DataFrame, kf: KalmanResult,
+             entry_z: float = ENTRY_Z, exit_z: float = EXIT_Z,
+             tc: float = TC_PER_TURNOVER, z_window: int = 100) -> pd.DataFrame:
+    """
+    Trade the spread defined by the Kalman-estimated hedge ratio.
+
+    Position convention:
+      pos = +1 means LONG y (ETH) and SHORT beta_t units of x (BTC).
+      pos = -1 is the mirror image.
+
+    PnL per step (from t to t+1) when holding position `pos` set at t:
+        pnl_t+1 = pos * (delta_y - beta_t * delta_x)
+
+    IMPORTANT NOTE on the trading signal — what we trade is NOT the Kalman
+    innovation e_t. A well-tuned Kalman filter produces innovations that are
+    a martingale difference sequence (uncorrelated by construction — the
+    filter has already extracted the predictable component). What we trade
+    is the *posterior spread*:
+
+        s_t = y_t - β_{t|t} * x_t - α_{t|t}
+
+    This is the residual after the filter's best estimate of the equilibrium
+    relationship. When this drifts away from zero, we bet it returns. We
+    standardise it with a rolling z-score to make thresholds dimensionless.
+    """
+    x = df[SYMBOL_X].to_numpy()
+    y = df[SYMBOL_Y].to_numpy()
+    beta  = kf.beta
+    alpha = kf.alpha
+
+    # The posterior spread: y minus the filter's current best fit.
+    spread = y - beta * x - alpha
+    spread_s = pd.Series(spread)
+
+    # Rolling empirical z-score of the spread.
+    z = ((spread_s - spread_s.rolling(z_window).mean())
+          / spread_s.rolling(z_window).std()).to_numpy()
+    z = np.nan_to_num(z, nan=0.0)
+
+    # Skip the burn-in period where the filter is still finding its feet.
+    burn_in = max(200, z_window + 20)
+
+    n = len(df)
+    pos = np.zeros(n)
+
+    for t in range(burn_in, n):
+        prev = pos[t-1]
+        if prev == 0:
+            if   z[t] < -entry_z: pos[t] = +1   # spread low -> long
+            elif z[t] > +entry_z: pos[t] = -1   # spread high -> short
+        else:
+            # Exit when |z| drops back inside the band, OR flip if it crosses
+            # to the opposite extreme.
+            if abs(z[t]) < exit_z:
+                pos[t] = 0
+            elif prev == +1 and z[t] > +entry_z:
+                pos[t] = -1
+            elif prev == -1 and z[t] < -entry_z:
+                pos[t] = +1
+            else:
+                pos[t] = prev
+
+    # PnL alignment, written explicitly:
+    # The position chosen at time t is held *into* t+1, so its PnL is
+    # realised at t+1 from the price move t -> t+1:
+    #
+    #     pnl[t+1] = pos[t] * ( (y[t+1] - y[t]) - beta[t] * (x[t+1] - x[t]) )
+    #
+    # We use beta[t] (the hedge ratio at the time of the trade) — using
+    # beta[t+1] would peek into the future.
+    pnl_spread = np.zeros(n)
+    pnl_spread[1:] = pos[:-1] * ((y[1:] - y[:-1]) - beta[:-1] * (x[1:] - x[:-1]))
+
+    # Transaction costs: paid on every change in position. We charge `tc`
+    # on the y-leg notional times |delta_pos| (a conservative round-trip
+    # approximation).
+    turnover = np.abs(np.diff(pos, prepend=0))
+    costs = tc * y * turnover
+    pnl = pnl_spread - costs
+
+    out = df.copy()
+    out["beta"]   = beta
+    out["z"]      = z          # empirical rolling z-score (the trading signal)
+    out["z_kf"]   = kf.z       # analytic Kalman z (kept for diagnostics)
+    out["pos"]    = pos
+    out["pnl"]    = pnl
+    out["equity"] = pnl.cumsum()
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Reporting
+# -----------------------------------------------------------------------------
+
+def report(bt: pd.DataFrame) -> None:
+    pnl   = bt["pnl"].to_numpy()
+    eq    = bt["equity"].to_numpy()
+    pos   = bt["pos"].to_numpy()
+    n_trd = int((np.diff(pos) != 0).sum())
+
+    # Annualise assuming hourly bars: 24*365 = 8760 bars/year.
+    bars_per_year = 8760
+    mean = pnl.mean() * bars_per_year
+    sd   = pnl.std()  * np.sqrt(bars_per_year)
+    sharpe = mean / sd if sd > 0 else float("nan")
+
+    print()
+    print("=" * 60)
+    print("BACKTEST SUMMARY")
+    print("=" * 60)
+    print(f"Bars:            {len(bt)}")
+    print(f"Trades:          {n_trd}")
+    print(f"Total PnL ($):   {eq[-1]:,.2f}")
+    print(f"Mean PnL/bar:    {pnl.mean():.4f}")
+    print(f"Sharpe (ann.):   {sharpe:.2f}")
+    print(f"Max drawdown:    {(eq - np.maximum.accumulate(eq)).min():,.2f}")
+    print("=" * 60)
+
+
+def plot_results(bt: pd.DataFrame) -> None:
+    fig, axes = plt.subplots(4, 1, figsize=(13, 11), sharex=True)
+
+    # 1. Prices on twin axes (different scales).
+    ax = axes[0]
+    ax.plot(bt.index, bt[SYMBOL_Y], label=SYMBOL_Y, color="#4477aa")
+    ax.set_ylabel(SYMBOL_Y, color="#4477aa")
+    ax2 = ax.twinx()
+    ax2.plot(bt.index, bt[SYMBOL_X], label=SYMBOL_X, color="#ee6677", alpha=0.7)
+    ax2.set_ylabel(SYMBOL_X, color="#ee6677")
+    ax.set_title(f"Prices: {SYMBOL_Y} vs {SYMBOL_X}")
+
+    # 2. Kalman-estimated beta over time.
+    axes[1].plot(bt.index, bt["beta"], color="#228833")
+    axes[1].set_title(f"Kalman-estimated hedge ratio  β_t  "
+                      f"({SYMBOL_Y} = β·{SYMBOL_X} + α)")
+    axes[1].set_ylabel("β")
+    axes[1].grid(alpha=0.3)
+
+    # 3. Standardized spread (rolling z-score) with bands.
+    axes[2].plot(bt.index, bt["z"], color="#aa3377", lw=0.8)
+    axes[2].axhline( ENTRY_Z, color="red",  ls="--", lw=0.8, label=f"±{ENTRY_Z} entry")
+    axes[2].axhline(-ENTRY_Z, color="red",  ls="--", lw=0.8)
+    axes[2].axhline( EXIT_Z,  color="gray", ls=":",  lw=0.8, label=f"±{EXIT_Z} exit")
+    axes[2].axhline(-EXIT_Z,  color="gray", ls=":",  lw=0.8)
+    axes[2].axhline(0, color="black", lw=0.5)
+    axes[2].set_title("Spread z-score  (y − β·x − α, rolling-normalised)  — the trading signal")
+    axes[2].set_ylabel("z-score")
+    axes[2].legend(loc="upper right", fontsize=8)
+    axes[2].grid(alpha=0.3)
+
+    # 4. Equity curve with position shading.
+    axes[3].plot(bt.index, bt["equity"], color="#000000")
+    axes[3].fill_between(bt.index, bt["equity"].min(), bt["equity"].max(),
+                         where=(bt["pos"] > 0), color="green", alpha=0.08, label="long spread")
+    axes[3].fill_between(bt.index, bt["equity"].min(), bt["equity"].max(),
+                         where=(bt["pos"] < 0), color="red",   alpha=0.08, label="short spread")
+    axes[3].set_title("Cumulative PnL ($, after costs)")
+    axes[3].set_ylabel("equity")
+    axes[3].legend(loc="upper left", fontsize=8)
+    axes[3].grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig("kalman_pairs.png", dpi=110)
+    print("Saved figure to kalman_pairs.png")
+
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+def calibrate_R(x: np.ndarray, y: np.ndarray, window: int = 30) -> float:
+    """
+    Estimate R (observation noise variance) from *local* OLS residuals.
+
+    A single OLS over the whole sample would conflate time-varying beta drift
+    with observation noise and inflate R massively. Instead we slide a short
+    window where beta is approximately constant, fit OLS in each window, and
+    take the median of those residual variances. Short window matters: long
+    windows still let beta drift contaminate the residuals.
+    """
+    n = len(y)
+    variances = []
+    for start in range(0, n - window, window // 2):
+        xs = x[start:start + window]
+        ys = y[start:start + window]
+        X = np.column_stack([xs, np.ones_like(xs)])
+        coef, *_ = np.linalg.lstsq(X, ys, rcond=None)
+        resid = ys - X @ coef
+        variances.append(np.var(resid))
+    return float(np.median(variances))
+
+
+def main() -> None:
+    df = load_data()
+    x = df[SYMBOL_X].to_numpy()
+    y = df[SYMBOL_Y].to_numpy()
+
+    R = calibrate_R(x, y) if AUTO_R else R_OBS
+    print(f"\nRunning Kalman filter (delta={DELTA}, R={R:.4g}"
+          f"{' [auto]' if AUTO_R else ''})...")
+    kf = run_kalman(x, y, delta=DELTA, R=R)
+
+    print(f"  final β = {kf.beta[-1]:.6f}")
+    print(f"  final α = {kf.alpha[-1]:.4f}")
+    print(f"  z-score range: [{kf.z[200:].min():.2f}, {kf.z[200:].max():.2f}]"
+          "   (after burn-in)")
+
+    bt = backtest(df, kf)
+    report(bt)
+    plot_results(bt)
+
+
+if __name__ == "__main__":
+    main()
