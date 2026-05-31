@@ -51,7 +51,7 @@ def update_state(
     """Kalman measurement update step.
 
     Model:
-        z_t = H x_t + measurement_noise
+        z_t = H @ x_t + measurement_noise
         measurement_noise ~ N(0, R)
 
     Args:
@@ -64,7 +64,8 @@ def update_state(
     Returns:
         ``(x_updated, P_updated, K)``, where ``K`` is the Kalman gain.
     """
-    raise NotImplementedError("Exercise: implement the Kalman update step.")
+    K = 0.42
+    x_updated = np.linalg.inv(H @ P_pred @ H.T) @ ()
 
 
 def run_scalar_random_walk_filter(
